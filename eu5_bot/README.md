@@ -73,6 +73,9 @@ python -m eu5_bot.main --headless -n 3
 
 # Forcer un rescan mémoire (après une mise à jour du jeu) puis quitter
 python -m eu5_bot.main --rescan
+
+# Calibrer une adresse sur le jeu réel par scan différentiel interactif
+python -m eu5_bot.main --calibrate tresor
 ```
 
 ### Interface desktop
@@ -136,13 +139,34 @@ le pipeline complet en mode mock.
 
 ---
 
+## Scan mémoire différentiel
+
+Le scan est un **scan différentiel multi-passes** (technique type Cheat Engine),
+seul moyen fiable d'isoler une adresse face aux milliers de candidats qu'un scan
+de valeur unique renvoie sur un vrai processus :
+
+1. `first_scan(valeur)` — toutes les adresses contenant la valeur connue.
+2. La valeur évolue dans le jeu (temps qui passe, trésor qui change…).
+3. `next_scan(nouvelle_valeur)` — ne garde que les candidats valant désormais la
+   nouvelle valeur.
+4. Répéter jusqu'à une adresse unique ; on en dérive une **signature AOB** et un
+   offset relatif au module, puis on persiste dans `MemoryMap`.
+
+- **Régions mémoire réelles** : `PymemBackend.enum_regions()` énumère via
+  `VirtualQueryEx` les régions committées et lisibles ; `scan_value` (partagé)
+  les parcourt par blocs avec recouvrement pour ne manquer aucune occurrence.
+- **Sources des valeurs successives** :
+  - hors-ligne / tests → le `MockMemoryBackend` fournit `value_provider`
+    (lecture directe) et `settle` (avance du temps simulé), avec des **leurres**
+    figés pour exercer réellement le différentiel ;
+  - jeu réel → **calibration interactive** via `--calibrate <champ>` : on saisit
+    la valeur affichée à l'écran, on laisse le jeu la faire évoluer, le scan
+    converge puis enregistre l'adresse dans la carte mémoire.
+- `MemorySignature` conserve les `candidates` survivants et un score de
+  `confidence` (1.0 quand une seule adresse subsiste).
+
 ## Notes d'implémentation & limites
 
-- **Adresses mémoire réelles** : `SCAN_PLAN` (dans `scanner.py`) liste les champs
-  économiques visés. Le scan localise une valeur de référence puis dérive une
-  **signature AOB** des octets voisins pour résister aux patchs. Les *valeurs de
-  référence* réelles doivent être calibrées sur la machine de jeu (l'API
-  `MemoryScanner.scan(reference_values=...)` accepte cette calibration).
 - **Coordonnées d'interface** : `actions/executor.py::UI_HINTS` regroupe les
   raccourcis/clics, à calibrer selon la résolution et la version du jeu.
 - **Provinces** : la PHASE 1 cartographie l'économie d'abord (cf. brief) ; le

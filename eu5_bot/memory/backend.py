@@ -3,10 +3,12 @@
 Le reste du bot ne dépend que de l'interface ``MemoryBackend``. Deux
 implémentations sont fournies :
 
-    - ``PymemBackend``     : lecture réelle via ``pymem`` (Windows + jeu lancé).
+    - ``PymemBackend``     : lecture réelle via ``pymem`` (Windows + jeu lancé),
+      avec énumération des régions mémoire et scan complet de toutes les valeurs.
     - ``MockMemoryBackend``: simulation d'une partie qui évolue dans le temps,
-      permettant de développer et tester le bot hors-ligne, sans le jeu ni
-      Windows. C'est le backend par défaut sur les plateformes non-Windows.
+      avec des *leurres* (adresses figées partageant la valeur initiale d'un
+      champ) afin que le scan différentiel soit réellement exercé et testable
+      hors-ligne, sans le jeu ni Windows.
 
 ``open_memory_backend()`` choisit automatiquement le bon backend selon la
 configuration et la disponibilité de ``pymem``.
@@ -19,6 +21,9 @@ import math
 import random
 import struct
 import time
+
+# Taille des blocs lus lors d'un scan de région (1 Mio).
+SCAN_CHUNK = 0x100000
 
 
 class MemoryBackend(abc.ABC):
@@ -35,14 +40,52 @@ class MemoryBackend(abc.ABC):
         """Adresse de base du module principal du jeu."""
 
     @abc.abstractmethod
-    def read_bytes(self, address: int, size: int) -> bytes:
-        """Lit ``size`` octets bruts à ``address``."""
+    def enum_regions(self) -> list[tuple[int, int]]:
+        """Énumère les régions mémoire lisibles ``(adresse_base, taille)``."""
 
     @abc.abstractmethod
-    def scan_value(self, raw: bytes) -> list[int]:
-        """Renvoie toutes les adresses où la séquence ``raw`` est présente."""
+    def read_bytes(self, address: int, size: int) -> bytes:
+        """Lit ``size`` octets bruts à ``address`` (b"" si illisible)."""
 
-    # --- Lecture typée (implémentations par défaut basées sur read_bytes) --- #
+    # ------------------------------------------------------------------ #
+    # Scan complet par régions (implémentation partagée)
+    # ------------------------------------------------------------------ #
+    def scan_value(self, raw: bytes) -> list[int]:
+        """Renvoie TOUTES les adresses où la séquence ``raw`` apparaît.
+
+        Parcourt chaque région par blocs avec recouvrement (``len(raw) - 1``)
+        afin de capturer les occurrences à cheval sur deux blocs.
+        """
+        n = len(raw)
+        if n == 0:
+            return []
+        results: list[int] = []
+        for base, size in self.enum_regions():
+            offset = 0
+            prev_tail = b""
+            tail_len = n - 1
+            while offset < size:
+                to_read = min(SCAN_CHUNK, size - offset)
+                data = self.read_bytes(base + offset, to_read)
+                if not data:
+                    offset += to_read
+                    prev_tail = b""
+                    continue
+                buf = prev_tail + data
+                # L'octet 0 de ``buf`` correspond à l'adresse :
+                buf_start_addr = base + offset - len(prev_tail)
+                start = 0
+                while True:
+                    i = buf.find(raw, start)
+                    if i == -1:
+                        break
+                    results.append(buf_start_addr + i)
+                    start = i + 1
+                prev_tail = buf[-tail_len:] if tail_len > 0 else b""
+                offset += to_read
+        return results
+
+    # --- Lecture typée (basée sur read_bytes) --- #
     def read_i32(self, address: int) -> int:
         return struct.unpack("<i", self.read_bytes(address, 4))[0]
 
@@ -70,9 +113,11 @@ class MemoryBackend(abc.ABC):
 class MockMemoryBackend(MemoryBackend):
     """Simule un processus EU5 : une partie économique qui évolue.
 
-    Le backend maintient un dictionnaire ``field -> (address, value)`` et écrit
-    les valeurs dans un espace mémoire factice afin que le scan par valeur et la
-    lecture typée se comportent comme face à un vrai processus.
+    Le backend maintient les champs économiques à des adresses dédiées et y
+    écrit des valeurs variant lentement dans le temps. Il place en outre des
+    *leurres* : des adresses figées contenant la valeur initiale de certains
+    champs, de sorte qu'un scan de valeur unique reste ambigu et que seul le
+    scan différentiel parvient à isoler la bonne adresse — comme face au jeu.
     """
 
     available = True
@@ -80,7 +125,7 @@ class MockMemoryBackend(MemoryBackend):
 
     def __init__(self, seed: int = 1337) -> None:
         self._rng = random.Random(seed)
-        self._mem = bytearray(0x2000)  # tampon mémoire factice
+        self._mem = bytearray(0x4000)  # tampon mémoire factice
         self._addr_of: dict[str, int] = {}
         self._type_of: dict[str, str] = {}
         self._t0 = time.time()
@@ -108,7 +153,23 @@ class MockMemoryBackend(MemoryBackend):
             self._addr_of[fld] = self._BASE + offset
             self._type_of[fld] = vtype
             offset += 0x40  # espacement entre champs
-        self._write_state()
+        self._write_state(force=True)
+        self._place_decoys()
+
+    def _place_decoys(self) -> None:
+        """Écrit des leurres figés égaux à la valeur initiale de certains champs.
+
+        Ces adresses ne sont JAMAIS mises à jour par ``_write_state`` : elles
+        rendent le premier scan ambigu (plusieurs candidats) tout en se laissant
+        éliminer par le scan différentiel dès que le vrai champ change.
+        """
+        decoy_offset = 0x800
+        for fld in ("tresor", "manpower"):
+            vtype = self._type_of[fld]
+            value = self.read_typed(self._addr_of[fld], vtype)
+            for _ in range(2):  # deux leurres par champ
+                self._write_typed(self._BASE + decoy_offset, vtype, value)
+                decoy_offset += 0x40
 
     def _write_typed(self, address: int, value_type: str, value) -> None:
         idx = address - self._BASE
@@ -125,8 +186,8 @@ class MockMemoryBackend(MemoryBackend):
 
         Le calcul est *throttlé* (au plus une fois par 0.25 s) afin que toutes
         les lectures effectuées pendant un même scan (qui dure quelques ms)
-        portent sur un instantané cohérent ; entre deux cycles de jeu (espacés
-        de plusieurs secondes), l'état est rafraîchi et varie comme attendu.
+        portent sur un instantané cohérent ; entre deux cycles de jeu (ou après
+        ``advance``), l'état est rafraîchi et varie comme attendu.
         """
         now = time.time()
         if not force and (now - self._last_write) < 0.25:
@@ -159,6 +220,15 @@ class MockMemoryBackend(MemoryBackend):
         for fld, val in values.items():
             self._write_typed(self._addr_of[fld], self._type_of[fld], val)
 
+    def advance(self, seconds: float) -> None:
+        """Avance le temps simulé (utilisé par le scan différentiel hors-ligne).
+
+        Décale l'origine temporelle puis force un recalcul : les champs évoluent,
+        les leurres restent figés.
+        """
+        self._t0 -= seconds
+        self._write_state(force=True)
+
     # -- interface MemoryBackend -- #
     def attach(self) -> bool:
         return True
@@ -166,8 +236,11 @@ class MockMemoryBackend(MemoryBackend):
     def module_base(self) -> int:
         return self._BASE
 
+    def enum_regions(self) -> list[tuple[int, int]]:
+        return [(self._BASE, len(self._mem))]
+
     def address_of(self, field: str) -> int:
-        """Adresse simulée d'un champ (utilisée par le scanner mock)."""
+        """Adresse simulée d'un champ (utilisée par les tests / la calibration)."""
         return self._addr_of.get(field, 0)
 
     def type_of(self, field: str) -> str:
@@ -177,23 +250,11 @@ class MockMemoryBackend(MemoryBackend):
         return list(self._addr_of)
 
     def read_bytes(self, address: int, size: int) -> bytes:
-        self._write_state()  # rafraîchit l'état avant chaque lecture
+        self._write_state()  # rafraîchit l'état (throttlé) avant lecture
         idx = address - self._BASE
         if idx < 0 or idx + size > len(self._mem):
             return b"\x00" * size
         return bytes(self._mem[idx : idx + size])
-
-    def scan_value(self, raw: bytes) -> list[int]:
-        self._write_state()
-        hits = []
-        start = 0
-        while True:
-            i = self._mem.find(raw, start)
-            if i == -1:
-                break
-            hits.append(self._BASE + i)
-            start = i + 1
-        return hits
 
 
 def open_memory_backend(config) -> MemoryBackend:

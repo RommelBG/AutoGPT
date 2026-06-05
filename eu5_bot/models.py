@@ -98,6 +98,10 @@ class MemorySignature:
     offsets: list[int] = field(default_factory=list)
     pattern: str = ""
     value_type: str = "i32"  # i32 | i64 | f32 | f64
+    # Candidats restants après le scan différentiel (le 1er est retenu) et
+    # confiance ∈ [0,1] : 1.0 si une seule adresse a survécu, sinon dégressive.
+    candidates: list[int] = field(default_factory=list)
+    confidence: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
