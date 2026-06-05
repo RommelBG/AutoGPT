@@ -32,6 +32,26 @@ def test_read_provinces_values():
     assert provs[3].developpement == 9
 
 
+def test_province_name_scan():
+    backend = MockMemoryBackend()
+    backend.attach()
+    layout = MemoryScanner(backend).scan().province_layout
+    assert layout.name_offset == backend._NAME_PTR_OFF
+    provs = read_provinces(backend, layout, backend.module_base())
+    assert [p.nom for p in provs] == backend._PROV_NAMES
+    # Inclut un nom accentué : valide le décodage UTF-8.
+    assert provs[2].nom == "Vallée-Fertile"
+
+
+def test_province_names_persist_after_relaunch():
+    backend = MockMemoryBackend()
+    backend.attach()
+    layout = MemoryScanner(backend).scan().province_layout
+    backend.relaunch()  # déplace le tas : pointeurs de nom rebasés
+    provs = read_provinces(backend, layout, backend.module_base())
+    assert [p.nom for p in provs] == backend._PROV_NAMES
+
+
 def test_province_layout_has_persistent_pointer_chain():
     backend = MockMemoryBackend()
     backend.attach()
@@ -61,4 +81,4 @@ def test_reader_exposes_provinces_via_layout():
     mmap = MemoryScanner(backend).scan()
     state = GameStateReader(backend, mmap).read()
     assert len(state.provinces) == 4
-    assert state.provinces[0].nom == "Province 1"
+    assert state.provinces[0].nom == "Capitale"

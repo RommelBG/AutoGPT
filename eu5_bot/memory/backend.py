@@ -187,6 +187,9 @@ class MockMemoryBackend(MemoryBackend):
     _PROV_OFF = 0x2000
     _PROV_STRIDE = 0x80
     _PROV_COUNT = 4
+    _NAME_OFF = 0x2400       # zone des chaînes de noms (dans le tas)
+    _NAME_STRIDE = 0x40
+    _NAME_PTR_OFF = 0x10     # offset, dans la struct province, du pointeur de nom
 
     # Disposition d'une struct province (offset relatif, type).
     _PROV_FIELDS = {
@@ -194,6 +197,7 @@ class MockMemoryBackend(MemoryBackend):
         "slots_disponibles": (0x04, "i32"),
         "nb_batiments": (0x08, "i32"),
         "base_tax": (0x0C, "f32"),
+        # 0x10 : pointeur de nom (char*) — voir _write_name_pointers.
     }
     # Valeurs par province (servent de calibration au scan de provinces).
     _PROV_VALUES = {
@@ -202,6 +206,7 @@ class MockMemoryBackend(MemoryBackend):
         "nb_batiments": [2, 1, 0, 0],
         "base_tax": [12.0, 10.0, 8.0, 5.0],
     }
+    _PROV_NAMES = ["Capitale", "Port-Marchand", "Vallée-Fertile", "Bordure"]
 
     def __init__(self, seed: int = 1337) -> None:
         self._rng = random.Random(seed)
@@ -236,10 +241,15 @@ class MockMemoryBackend(MemoryBackend):
     def _prov_base(self) -> int:
         return self._heap_base() + self._PROV_OFF
 
+    def _name_addr(self, i: int) -> int:
+        return self._heap_base() + self._NAME_OFF + i * self._NAME_STRIDE
+
     # -- mise en place -- #
     def _layout(self) -> None:
         self._write_state(force=True)
         self._write_provinces()
+        self._write_names()
+        self._write_name_pointers()
         self._place_decoys()
         self._write_pointers()
 
@@ -255,6 +265,20 @@ class MockMemoryBackend(MemoryBackend):
             for fld, (off, vtype) in self._PROV_FIELDS.items():
                 self._write_typed(base + i * self._PROV_STRIDE + off, vtype,
                                   self._PROV_VALUES[fld][i])
+
+    def _write_names(self) -> None:
+        """Écrit les chaînes de noms (UTF-8 terminées par un octet nul)."""
+        for i, name in enumerate(self._PROV_NAMES):
+            raw = name.encode("utf-8") + b"\x00"
+            idx = self._name_addr(i) - self._BASE
+            self._mem[idx : idx + len(raw)] = raw
+
+    def _write_name_pointers(self) -> None:
+        """Écrit, dans chaque struct province, le pointeur (char*) vers son nom."""
+        base = self._prov_base()
+        for i in range(self._PROV_COUNT):
+            self._write_typed(base + i * self._PROV_STRIDE + self._NAME_PTR_OFF,
+                              "i64", self._name_addr(i))
 
     def _place_decoys(self) -> None:
         """Leurres figés égaux à la valeur initiale de tresor / manpower."""
@@ -323,17 +347,21 @@ class MockMemoryBackend(MemoryBackend):
         old = self._heap_off
         if new_heap_off is None:
             new_heap_off = 0x18000 if old == 0x10000 else 0x10000
-        span = self._PROV_OFF + self._PROV_COUNT * self._PROV_STRIDE + 0x100
+        span = 0x3000  # couvre éco, leurres, provinces et zone des noms
         block = bytes(self._mem[old : old + span])
         # efface l'ancien emplacement, recopie au nouveau
         self._mem[old : old + span] = b"\x00" * span
         self._heap_off = new_heap_off
         self._mem[new_heap_off : new_heap_off + span] = block
+        # rebase les pointeurs de nom (absolus) vers la nouvelle zone de chaînes,
+        # puis recâble les pointeurs statiques du module.
+        self._write_name_pointers()
         self._write_pointers()
 
     # -- calibration provinces (sert d'oracle au scan de provinces) -- #
     def province_calibration(self) -> tuple[dict[str, list], dict[str, str]]:
         values = {k: list(v) for k, v in self._PROV_VALUES.items()}
+        values["noms"] = list(self._PROV_NAMES)  # noms (chaînes) pour le scan de noms
         types = {k: t for k, (_, t) in self._PROV_FIELDS.items()}
         return values, types
 

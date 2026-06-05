@@ -65,9 +65,16 @@ def extract_json(text: str) -> dict[str, Any]:
 class LLMClient:
     """Effectue les appels LLM pour un conseiller donné, avec repli mock."""
 
-    def __init__(self, config: Config, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        config: Config,
+        timeout: float = 60.0,
+        transport: "httpx.BaseTransport | httpx.AsyncBaseTransport | None" = None,
+    ) -> None:
         self.config = config
         self.timeout = timeout
+        # Transport injectable (ex. httpx.MockTransport) pour les tests.
+        self._transport = transport
 
     # ------------------------------------------------------------------ #
     # Routage
@@ -124,7 +131,10 @@ class LLMClient:
             "response_format": {"type": "json_object"},
         }
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        kwargs = {"timeout": self.timeout}
+        if self._transport is not None:
+            kwargs["transport"] = self._transport
+        async with httpx.AsyncClient(**kwargs) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             body = resp.json()

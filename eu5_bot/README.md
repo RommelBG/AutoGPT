@@ -191,12 +191,20 @@ chaîne de pointeurs vers la base du tableau est recherchée pour la persistance
 Le résultat (`ProvinceLayout`) permet de lire dynamiquement toutes les provinces
 (développement, slots, nombre de bâtiments).
 
+Les **noms de provinces** (chaînes) sont également résolus : le scan localise le
+nom d'une province par valeur, en déduit l'offset du **pointeur de nom** (char*)
+dans la structure (vérifié sur une 2ᵉ province), avec auto-détection de
+l'encodage (UTF-8 / UTF-16-LE). Les noms sont déréférencés à la lecture et
+restent corrects après une relance (pointeurs de nom rebasés).
+
 ## Notes d'implémentation & limites
 
 - **Coordonnées d'interface** : `actions/executor.py::UI_HINTS` regroupe les
   raccourcis/clics, à calibrer selon la résolution et la version du jeu.
-- **Noms de provinces** : le scan lit les champs numériques (développement,
-  slots, bâtiments) ; les **chaînes de caractères** (noms réels) ne sont pas
-  encore extraites, donc les provinces sont nommées « Province N ». L'exécuteur
-  d'actions devra cibler les provinces par coordonnées/ID plutôt que par nom tant
-  que le scan des chaînes n'est pas implémenté.
+- **Noms de provinces** : lus via le pointeur de nom de la structure (UTF-8 /
+  UTF-16 auto-détecté). Le stockage réel des chaînes dans EU5 peut différer
+  (pool de chaînes, longueur préfixée) et nécessiter une calibration ; à défaut
+  de pointeur de nom détecté, les provinces retombent sur « Province N ».
+- **Journal des décisions** : chaque cycle est consigné dans
+  `~/.eu5_bot/decisions.jsonl` (une ligne JSON par décision), en plus de l'export
+  `.txt` de l'interface.

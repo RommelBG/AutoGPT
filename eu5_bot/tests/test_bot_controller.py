@@ -1,5 +1,7 @@
 """Tests du contrôleur principal en mode mock (mémoire + actions simulées)."""
 
+import json
+
 from eu5_bot.bot import BotController
 from eu5_bot.config import Config
 
@@ -34,6 +36,21 @@ def test_advisor_toggle_disables_advisor(tmp_path, monkeypatch):
     # Seuls 3 conseillers actifs participent.
     assert {a.advisor for a in decision.advisors} == {
         "Trésorier", "Constructeur", "Contradicteur"}
+
+
+def test_decisions_are_logged_to_jsonl(tmp_path, monkeypatch):
+    monkeypatch.setattr("eu5_bot.bot.MEMORY_MAP_PATH", tmp_path / "map.json")
+    bot = BotController(_mock_config())
+    bot.decisions_log_path = tmp_path / "decisions.jsonl"
+    bot.ensure_memory_map()
+    bot.tick_once()
+    bot.tick_once()
+
+    lines = bot.decisions_log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    entry = json.loads(lines[0])
+    assert "decision" in entry and "consensus" in entry and "date" in entry
+    assert entry["sources"]  # la trace des conseillers est journalisée
 
 
 def test_date_progresses_across_ticks(tmp_path, monkeypatch):

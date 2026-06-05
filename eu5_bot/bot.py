@@ -14,12 +14,13 @@ activation/désactivation des conseillers, rescan mémoire forcé.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import deque
 from typing import Callable
 
-from .config import Config, MEMORY_MAP_PATH, load_config
+from .config import Config, DATA_DIR, MEMORY_MAP_PATH, load_config
 from .council import Council
 from .actions import ActionExecutor, open_action_backend
 from .memory import GameStateReader, MemoryScanner, open_memory_backend
@@ -55,6 +56,8 @@ class BotController:
         self.history: deque[CouncilDecision] = deque(maxlen=20)
         self.last_state: GameState | None = None
         self._game_date = "1337.1.1"  # date de jeu suivie d'un cycle à l'autre
+        # Journal persistant des décisions (une ligne JSON par cycle).
+        self.decisions_log_path = DATA_DIR / "decisions.jsonl"
 
         # Callbacks d'interface (tous optionnels).
         self.on_state: Callable[[GameState], None] | None = None
@@ -151,7 +154,33 @@ class BotController:
         report = self.executor.execute(decision)
         if self.on_action:
             self.on_action(report)
+
+        self._log_decision(state, decision, report)
         return decision
+
+    def _log_decision(self, state: GameState, decision: CouncilDecision, report: dict) -> None:
+        """Ajoute une ligne JSON au journal persistant des décisions."""
+        try:
+            self.decisions_log_path.parent.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "date": state.date,
+                "tresor": round(state.tresor, 1),
+                "revenu_mensuel": round(state.revenu_mensuel, 1),
+                "inflation": round(state.inflation, 2),
+                "decision": decision.decision_finale,
+                "province": decision.province,
+                "action": decision.action,
+                "consensus": decision.consensus,
+                "bloque": decision.bloque,
+                "raison_blocage": decision.raison_blocage,
+                "executee": report.get("executed", False),
+                "sources": [a.source for a in decision.advisors],
+                "timestamp": decision.timestamp,
+            }
+            with self.decisions_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass  # un échec d'écriture du journal ne doit pas interrompre la boucle
 
     # ------------------------------------------------------------------ #
     # Internes

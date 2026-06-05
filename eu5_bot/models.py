@@ -167,8 +167,10 @@ class ProvinceLayout:
     base_address: int = 0
     stride: int = 0
     count: int = 0
-    field_offsets: dict[str, int] = field(default_factory=dict)  # nom -> (offset, type)
+    field_offsets: dict[str, int] = field(default_factory=dict)  # nom -> offset
     field_types: dict[str, str] = field(default_factory=dict)
+    name_offset: int = -1  # offset du pointeur de nom (char*) ; -1 = inconnu
+    name_encoding: str = "utf-8"
     pointer_chain: "PointerChain | None" = None  # vers base_address (persistant)
 
     def to_dict(self) -> dict[str, Any]:
@@ -178,6 +180,8 @@ class ProvinceLayout:
             "count": self.count,
             "field_offsets": self.field_offsets,
             "field_types": self.field_types,
+            "name_offset": self.name_offset,
+            "name_encoding": self.name_encoding,
             "pointer_chain": self.pointer_chain.to_dict() if self.pointer_chain else None,
         }
 
@@ -190,6 +194,8 @@ class ProvinceLayout:
             count=data.get("count", 0),
             field_offsets={k: int(v) for k, v in data.get("field_offsets", {}).items()},
             field_types=dict(data.get("field_types", {})),
+            name_offset=data.get("name_offset", -1),
+            name_encoding=data.get("name_encoding", "utf-8"),
             pointer_chain=PointerChain.from_dict(pc) if pc else None,
         )
 

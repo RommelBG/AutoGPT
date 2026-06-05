@@ -70,9 +70,9 @@ class ProvinceScanner:
         layout.field_offsets["developpement"] = 0
         layout.field_types["developpement"] = dtype
 
-        # Offsets des autres champs (vérifiés sur une 2e province).
+        # Offsets des autres champs numériques (vérifiés sur une 2e province).
         for fld, vals in calibration_values.items():
-            if fld == "developpement" or not vals:
+            if fld in ("developpement", "noms") or not vals:
                 continue
             vtype = types.get(fld, "i32")
             cands = self._locate(vals[0], vtype, within=(base, base + stride))
@@ -82,6 +82,9 @@ class ProvinceScanner:
                 layout.field_types[fld] = vtype
 
         layout.count = self._detect_count(base, stride, dtype)
+
+        # Offset du pointeur de nom (char*) à partir des noms de calibration.
+        self._detect_name_offset(layout, base, stride, calibration_values.get("noms"))
 
         # Chaîne de pointeurs vers la base du tableau (persistance aux relances).
         if self.pointer_scanner is not None:
@@ -113,6 +116,32 @@ class ProvinceScanner:
             return off
         return None
 
+    def _detect_name_offset(self, layout, base, stride, names) -> None:
+        """Détermine l'offset du pointeur de nom (char*) dans la struct.
+
+        Localise la chaîne du nom de la province 0, puis cherche, aux offsets
+        alignés de la struct, un pointeur valant cette adresse — vérifié sur la
+        province 1.
+        """
+        if not names:
+            return
+        for encoding in ("utf-8", "utf-16-le"):
+            raw = names[0].encode(encoding)
+            hits = self.backend.scan_value(raw)
+            if not hits:
+                continue
+            name_addr0 = hits[0]
+            for off in range(0, stride - 8 + 1, 8):
+                if self.backend.read_pointer(base + off) != name_addr0:
+                    continue
+                if len(names) >= 2:
+                    a1 = self.backend.read_pointer(base + stride + off)
+                    if read_string(self.backend, a1, encoding=encoding) != names[1]:
+                        continue
+                layout.name_offset = off
+                layout.name_encoding = encoding
+                return
+
     def _detect_count(self, base, stride, dtype) -> int:
         count = 0
         for i in range(_MAX_COUNT):
@@ -125,6 +154,31 @@ class ProvinceScanner:
                 break
             count += 1
         return count
+
+
+def read_string(
+    backend: MemoryBackend, address: int, max_len: int = 64, encoding: str = "utf-8"
+) -> str:
+    """Lit une chaîne terminée par un (ou deux) octet(s) nul(s) à ``address``."""
+    if not address:
+        return ""
+    data = backend.read_bytes(address, max_len)
+    if not data:
+        return ""
+    if encoding.startswith("utf-16"):
+        end = len(data) - (len(data) % 2)
+        for j in range(0, end, 2):
+            if data[j] == 0 and data[j + 1] == 0:
+                data = data[:j]
+                break
+    else:
+        nul = data.find(b"\x00")
+        if nul != -1:
+            data = data[:nul]
+    try:
+        return data.decode(encoding, errors="replace")
+    except (UnicodeDecodeError, LookupError):
+        return ""
 
 
 def read_provinces(
@@ -149,12 +203,19 @@ def read_provinces(
                 return default
             return backend.read_typed(pbase + layout.field_offsets[name], layout.field_types[name])
 
+        # Nom : déréférence le pointeur de nom si son offset est connu.
+        if layout.name_offset >= 0:
+            name_addr = backend.read_pointer(pbase + layout.name_offset)
+            nom = read_string(backend, name_addr, encoding=layout.name_encoding) or f"Province {i + 1}"
+        else:
+            nom = f"Province {i + 1}"
+
         dev = int(field("developpement"))
         slots = int(field("slots_disponibles"))
         nb = int(field("nb_batiments"))
         provinces.append(
             Province(
-                nom=f"Province {i + 1}",
+                nom=nom,
                 developpement=dev,
                 slots_disponibles=slots,
                 batiments=[f"bâtiment {k + 1}" for k in range(max(0, nb))],
