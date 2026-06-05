@@ -63,6 +63,7 @@ class PymemBackend(MemoryBackend):
         self.process_name = process_name
         self._pm = None
         self._module_base = 0
+        self._module_size = 0
 
     def attach(self) -> bool:  # pragma: no cover - nécessite Windows + jeu
         try:
@@ -70,7 +71,11 @@ class PymemBackend(MemoryBackend):
             module = pymem.process.module_from_name(
                 self._pm.process_handle, self.process_name
             )
-            self._module_base = module.lpBaseOfDll if module else self._pm.base_address
+            if module:
+                self._module_base = module.lpBaseOfDll
+                self._module_size = getattr(module, "SizeOfImage", 0)
+            else:
+                self._module_base = self._pm.base_address
             return True
         except Exception:
             self._pm = None
@@ -78,6 +83,9 @@ class PymemBackend(MemoryBackend):
 
     def module_base(self) -> int:  # pragma: no cover
         return self._module_base
+
+    def module_range(self) -> tuple[int, int]:  # pragma: no cover
+        return (self._module_base, self._module_size)
 
     def enum_regions(self) -> list[tuple[int, int]]:  # pragma: no cover
         """Énumère les régions committées et lisibles du processus."""
@@ -116,13 +124,8 @@ class PymemBackend(MemoryBackend):
         except Exception:
             return b""  # région devenue illisible : ignorée par le scan
 
-    def resolve_pointer_chain(self, base: int, offsets: list[int]) -> int:  # pragma: no cover
-        """Résout une chaîne de pointeurs (base -> +offsets) vers l'adresse finale."""
-        assert self._pm is not None, "backend non attaché"
-        addr = base
-        for off in offsets[:-1]:
-            addr = self._pm.read_longlong(addr + off)
-        return addr + (offsets[-1] if offsets else 0)
+    # ``read_pointer``, ``build_pointer_index`` et ``resolve_chain`` sont fournis
+    # par ``MemoryBackend`` (implémentation partagée basée sur ``read_bytes``).
 
     def close(self) -> None:  # pragma: no cover
         if self._pm is not None:

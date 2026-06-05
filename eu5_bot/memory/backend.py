@@ -4,14 +4,16 @@ Le reste du bot ne dépend que de l'interface ``MemoryBackend``. Deux
 implémentations sont fournies :
 
     - ``PymemBackend``     : lecture réelle via ``pymem`` (Windows + jeu lancé),
-      avec énumération des régions mémoire et scan complet de toutes les valeurs.
-    - ``MockMemoryBackend``: simulation d'une partie qui évolue dans le temps,
-      avec des *leurres* (adresses figées partageant la valeur initiale d'un
-      champ) afin que le scan différentiel soit réellement exercé et testable
-      hors-ligne, sans le jeu ni Windows.
+      avec énumération des régions, scan de valeurs et index de pointeurs.
+    - ``MockMemoryBackend``: simulation complète : un module + un tas, des
+      pointeurs statiques (module → struct économique / tableau de provinces),
+      des leurres figés, et ``relaunch()`` qui rejoue l'ASLR (les adresses
+      absolues changent, les chaînes de pointeurs restent valides). Cela permet
+      d'exercer et tester hors-ligne le scan différentiel, le scan de pointeurs
+      et le scan de provinces.
 
-``open_memory_backend()`` choisit automatiquement le bon backend selon la
-configuration et la disponibilité de ``pymem``.
+``open_memory_backend()`` choisit automatiquement le backend selon la config et
+la disponibilité de ``pymem``.
 """
 
 from __future__ import annotations
@@ -22,12 +24,12 @@ import random
 import struct
 import time
 
-# Taille des blocs lus lors d'un scan de région (1 Mio).
+# Taille des blocs lus lors d'un scan/indexation de région (1 Mio).
 SCAN_CHUNK = 0x100000
 
 
 class MemoryBackend(abc.ABC):
-    """Interface minimale d'accès mémoire dont dépend le bot."""
+    """Interface d'accès mémoire dont dépend le bot."""
 
     available: bool = False
 
@@ -38,6 +40,10 @@ class MemoryBackend(abc.ABC):
     @abc.abstractmethod
     def module_base(self) -> int:
         """Adresse de base du module principal du jeu."""
+
+    @abc.abstractmethod
+    def module_range(self) -> tuple[int, int]:
+        """Plage du module principal ``(base, taille)`` — zone des pointeurs statiques."""
 
     @abc.abstractmethod
     def enum_regions(self) -> list[tuple[int, int]]:
@@ -51,11 +57,7 @@ class MemoryBackend(abc.ABC):
     # Scan complet par régions (implémentation partagée)
     # ------------------------------------------------------------------ #
     def scan_value(self, raw: bytes) -> list[int]:
-        """Renvoie TOUTES les adresses où la séquence ``raw`` apparaît.
-
-        Parcourt chaque région par blocs avec recouvrement (``len(raw) - 1``)
-        afin de capturer les occurrences à cheval sur deux blocs.
-        """
+        """Renvoie TOUTES les adresses où la séquence ``raw`` apparaît."""
         n = len(raw)
         if n == 0:
             return []
@@ -72,7 +74,6 @@ class MemoryBackend(abc.ABC):
                     prev_tail = b""
                     continue
                 buf = prev_tail + data
-                # L'octet 0 de ``buf`` correspond à l'adresse :
                 buf_start_addr = base + offset - len(prev_tail)
                 start = 0
                 while True:
@@ -84,6 +85,65 @@ class MemoryBackend(abc.ABC):
                 prev_tail = buf[-tail_len:] if tail_len > 0 else b""
                 offset += to_read
         return results
+
+    # ------------------------------------------------------------------ #
+    # Pointeurs (chaînes persistantes)
+    # ------------------------------------------------------------------ #
+    def read_pointer(self, address: int) -> int:
+        """Lit un pointeur 64 bits little-endian à ``address`` (0 si illisible)."""
+        data = self.read_bytes(address, 8)
+        if len(data) != 8:
+            return 0
+        return int.from_bytes(data, "little")
+
+    def build_pointer_index(self, alignment: int = 8) -> dict[int, list[int]]:
+        """Indexe ``valeur_pointée -> [adresses qui la contiennent]``.
+
+        Ne conserve que les pointeurs dont la valeur tombe dans une des régions
+        connues (élimine le bruit). Lit chaque région par gros blocs pour rester
+        efficace même sur un processus réel volumineux.
+        """
+        regions = self.enum_regions()
+        ranges = [(b, b + s) for b, s in regions]
+
+        def in_any(v: int) -> bool:
+            for lo, hi in ranges:
+                if lo <= v < hi:
+                    return True
+            return False
+
+        index: dict[int, list[int]] = {}
+        for base, size in regions:
+            offset = 0
+            while offset < size:
+                to_read = min(SCAN_CHUNK, size - offset)
+                data = self.read_bytes(base + offset, to_read)
+                if not data:
+                    offset += to_read
+                    continue
+                limit = len(data) - 8 + 1
+                start_align = (-(base + offset)) % alignment
+                i = start_align
+                while i < limit:
+                    v = int.from_bytes(data[i : i + 8], "little")
+                    if v and in_any(v):
+                        index.setdefault(v, []).append(base + offset + i)
+                    i += alignment
+                offset += to_read
+        return index
+
+    def resolve_chain(self, module_base: int, chain) -> int:
+        """Résout une ``PointerChain`` vers l'adresse finale de la valeur.
+
+        ptr = [module_base + static_offset] ; pour off in offsets[:-1] :
+        ptr = [ptr + off] ; adresse = ptr + offsets[-1].
+        """
+        ptr = self.read_pointer(module_base + chain.static_offset)
+        for off in chain.offsets[:-1]:
+            ptr = self.read_pointer(ptr + off)
+            if ptr == 0:
+                return 0
+        return ptr + (chain.offsets[-1] if chain.offsets else 0)
 
     # --- Lecture typée (basée sur read_bytes) --- #
     def read_i32(self, address: int) -> int:
@@ -111,65 +171,100 @@ class MemoryBackend(abc.ABC):
 
 
 class MockMemoryBackend(MemoryBackend):
-    """Simule un processus EU5 : une partie économique qui évolue.
-
-    Le backend maintient les champs économiques à des adresses dédiées et y
-    écrit des valeurs variant lentement dans le temps. Il place en outre des
-    *leurres* : des adresses figées contenant la valeur initiale de certains
-    champs, de sorte qu'un scan de valeur unique reste ambigu et que seul le
-    scan différentiel parvient à isoler la bonne adresse — comme face au jeu.
-    """
+    """Processus EU5 simulé : module + tas + pointeurs + provinces + leurres."""
 
     available = True
-    _BASE = 0x140000000  # base de module factice plausible (style x64)
+    _BASE = 0x140000000        # base du module (absolue, style x64)
+    _MODULE_SIZE = 0x1000      # taille de la zone "statique" (module)
+    _BUF = 0x40000             # taille du tampon mémoire factice
+    # Offsets, dans le module, des pointeurs statiques.
+    _PTR_ECO = 0x40            # -> base de la struct économique
+    _PTR_PROV = 0x60           # -> base du tableau de provinces
+    _COUNT_PROV = 0x68         # i32 : nombre de provinces
+    # Offsets, dans le tas, des sous-zones.
+    _ECO_OFF = 0x100
+    _DECOY_OFF = 0x800
+    _PROV_OFF = 0x2000
+    _PROV_STRIDE = 0x80
+    _PROV_COUNT = 4
+
+    # Disposition d'une struct province (offset relatif, type).
+    _PROV_FIELDS = {
+        "developpement": (0x00, "i32"),
+        "slots_disponibles": (0x04, "i32"),
+        "nb_batiments": (0x08, "i32"),
+        "base_tax": (0x0C, "f32"),
+    }
+    # Valeurs par province (servent de calibration au scan de provinces).
+    _PROV_VALUES = {
+        "developpement": [24, 18, 15, 9],
+        "slots_disponibles": [2, 3, 4, 1],
+        "nb_batiments": [2, 1, 0, 0],
+        "base_tax": [12.0, 10.0, 8.0, 5.0],
+    }
 
     def __init__(self, seed: int = 1337) -> None:
         self._rng = random.Random(seed)
-        self._mem = bytearray(0x4000)  # tampon mémoire factice
-        self._addr_of: dict[str, int] = {}
-        self._type_of: dict[str, str] = {}
+        self._mem = bytearray(self._BUF)
+        self._heap_off = 0x10000  # déplacé par relaunch() pour simuler l'ASLR
         self._t0 = time.time()
         self._last_write = 0.0
+        # Offsets des champs économiques dans la struct (relatifs à eco_base).
+        self._eco_fields = {
+            "tresor": (0x00, "f64"),
+            "revenu_taxes": (0x40, "f32"),
+            "revenu_production": (0x44, "f32"),
+            "revenu_commerce": (0x48, "f32"),
+            "revenu_sujets": (0x4C, "f32"),
+            "depenses_mensuelles": (0x50, "f32"),
+            "dettes": (0x54, "f32"),
+            "inflation": (0x58, "f32"),
+            "stabilite": (0x60, "i32"),
+            "manpower": (0x64, "i32"),
+            "score_puissance": (0x68, "i32"),
+            "menace_militaire": (0x6C, "i32"),
+        }
         self._layout()
 
-    # -- mise en place du "processus" simulé -- #
+    # -- adresses dérivées -- #
+    def _heap_base(self) -> int:
+        return self._BASE + self._heap_off
+
+    def _eco_base(self) -> int:
+        return self._heap_base() + self._ECO_OFF
+
+    def _prov_base(self) -> int:
+        return self._heap_base() + self._PROV_OFF
+
+    # -- mise en place -- #
     def _layout(self) -> None:
-        plan = [
-            ("tresor", "f64"),
-            ("revenu_taxes", "f32"),
-            ("revenu_production", "f32"),
-            ("revenu_commerce", "f32"),
-            ("revenu_sujets", "f32"),
-            ("depenses_mensuelles", "f32"),
-            ("dettes", "f32"),
-            ("inflation", "f32"),
-            ("stabilite", "i32"),
-            ("manpower", "i32"),
-            ("score_puissance", "i32"),
-            ("menace_militaire", "i32"),
-        ]
-        offset = 0x100
-        for fld, vtype in plan:
-            self._addr_of[fld] = self._BASE + offset
-            self._type_of[fld] = vtype
-            offset += 0x40  # espacement entre champs
         self._write_state(force=True)
+        self._write_provinces()
         self._place_decoys()
+        self._write_pointers()
+
+    def _write_pointers(self) -> None:
+        """(Ré)écrit les pointeurs statiques du module vers le tas courant."""
+        self._write_typed(self._BASE + self._PTR_ECO, "i64", self._eco_base())
+        self._write_typed(self._BASE + self._PTR_PROV, "i64", self._prov_base())
+        self._write_typed(self._BASE + self._COUNT_PROV, "i32", self._PROV_COUNT)
+
+    def _write_provinces(self) -> None:
+        base = self._prov_base()
+        for i in range(self._PROV_COUNT):
+            for fld, (off, vtype) in self._PROV_FIELDS.items():
+                self._write_typed(base + i * self._PROV_STRIDE + off, vtype,
+                                  self._PROV_VALUES[fld][i])
 
     def _place_decoys(self) -> None:
-        """Écrit des leurres figés égaux à la valeur initiale de certains champs.
-
-        Ces adresses ne sont JAMAIS mises à jour par ``_write_state`` : elles
-        rendent le premier scan ambigu (plusieurs candidats) tout en se laissant
-        éliminer par le scan différentiel dès que le vrai champ change.
-        """
-        decoy_offset = 0x800
+        """Leurres figés égaux à la valeur initiale de tresor / manpower."""
+        decoy = self._heap_base() + self._DECOY_OFF
         for fld in ("tresor", "manpower"):
-            vtype = self._type_of[fld]
-            value = self.read_typed(self._addr_of[fld], vtype)
-            for _ in range(2):  # deux leurres par champ
-                self._write_typed(self._BASE + decoy_offset, vtype, value)
-                decoy_offset += 0x40
+            off, vtype = self._eco_fields[fld]
+            value = self.read_typed(self._eco_base() + off, vtype)
+            for _ in range(2):
+                self._write_typed(decoy, vtype, value)
+                decoy += 0x40
 
     def _write_typed(self, address: int, value_type: str, value) -> None:
         idx = address - self._BASE
@@ -182,13 +277,8 @@ class MockMemoryBackend(MemoryBackend):
         self._mem[idx : idx + len(packed)] = packed
 
     def _write_state(self, force: bool = False) -> None:
-        """Calcule un état plausible variant lentement dans le temps.
-
-        Le calcul est *throttlé* (au plus une fois par 0.25 s) afin que toutes
-        les lectures effectuées pendant un même scan (qui dure quelques ms)
-        portent sur un instantané cohérent ; entre deux cycles de jeu (ou après
-        ``advance``), l'état est rafraîchi et varie comme attendu.
-        """
+        """État économique variant lentement (throttlé à 0.25 s pour des scans
+        cohérents)."""
         now = time.time()
         if not force and (now - self._last_write) < 0.25:
             return
@@ -201,7 +291,6 @@ class MockMemoryBackend(MemoryBackend):
         sujets = 3.0
         depenses = 30 + 5 * math.sin(t / 18.0)
         revenu = taxes + prod + commerce + sujets
-        # Trésor : accumule le revenu net au fil du temps
         tresor = 500 + (revenu - depenses) * (t / 5.0)
         values = {
             "tresor": max(0.0, tresor),
@@ -217,17 +306,36 @@ class MockMemoryBackend(MemoryBackend):
             "score_puissance": 55 + int(10 * wave),
             "menace_militaire": max(0, int(30 + 25 * math.sin(t / 35.0))),
         }
+        eco = self._eco_base()
         for fld, val in values.items():
-            self._write_typed(self._addr_of[fld], self._type_of[fld], val)
+            off, vtype = self._eco_fields[fld]
+            self._write_typed(eco + off, vtype, val)
 
     def advance(self, seconds: float) -> None:
-        """Avance le temps simulé (utilisé par le scan différentiel hors-ligne).
-
-        Décale l'origine temporelle puis force un recalcul : les champs évoluent,
-        les leurres restent figés.
-        """
+        """Avance le temps simulé (scan différentiel scalaire hors-ligne)."""
         self._t0 -= seconds
         self._write_state(force=True)
+
+    def relaunch(self, new_heap_off: int | None = None) -> None:
+        """Simule une relance du jeu : déplace le tas (ASLR) et recâble les
+        pointeurs statiques. Les adresses absolues changent, mais les chaînes de
+        pointeurs restent valides."""
+        old = self._heap_off
+        if new_heap_off is None:
+            new_heap_off = 0x18000 if old == 0x10000 else 0x10000
+        span = self._PROV_OFF + self._PROV_COUNT * self._PROV_STRIDE + 0x100
+        block = bytes(self._mem[old : old + span])
+        # efface l'ancien emplacement, recopie au nouveau
+        self._mem[old : old + span] = b"\x00" * span
+        self._heap_off = new_heap_off
+        self._mem[new_heap_off : new_heap_off + span] = block
+        self._write_pointers()
+
+    # -- calibration provinces (sert d'oracle au scan de provinces) -- #
+    def province_calibration(self) -> tuple[dict[str, list], dict[str, str]]:
+        values = {k: list(v) for k, v in self._PROV_VALUES.items()}
+        types = {k: t for k, (_, t) in self._PROV_FIELDS.items()}
+        return values, types
 
     # -- interface MemoryBackend -- #
     def attach(self) -> bool:
@@ -236,18 +344,22 @@ class MockMemoryBackend(MemoryBackend):
     def module_base(self) -> int:
         return self._BASE
 
+    def module_range(self) -> tuple[int, int]:
+        return (self._BASE, self._MODULE_SIZE)
+
     def enum_regions(self) -> list[tuple[int, int]]:
         return [(self._BASE, len(self._mem))]
 
     def address_of(self, field: str) -> int:
-        """Adresse simulée d'un champ (utilisée par les tests / la calibration)."""
-        return self._addr_of.get(field, 0)
+        if field in self._eco_fields:
+            return self._eco_base() + self._eco_fields[field][0]
+        return 0
 
     def type_of(self, field: str) -> str:
-        return self._type_of.get(field, "i32")
+        return self._eco_fields.get(field, (0, "i32"))[1]
 
     def fields(self) -> list[str]:
-        return list(self._addr_of)
+        return list(self._eco_fields)
 
     def read_bytes(self, address: int, size: int) -> bytes:
         self._write_state()  # rafraîchit l'état (throttlé) avant lecture
@@ -258,12 +370,7 @@ class MockMemoryBackend(MemoryBackend):
 
 
 def open_memory_backend(config) -> MemoryBackend:
-    """Sélectionne et ouvre le backend mémoire selon la configuration.
-
-    "auto"  : pymem si importable et processus présent, sinon mock.
-    "pymem" : force pymem (lève si indisponible).
-    "mock"  : force la simulation.
-    """
+    """Sélectionne et ouvre le backend mémoire selon la configuration."""
     mode = config.memory_backend
     if mode == "mock":
         backend: MemoryBackend = MockMemoryBackend()
@@ -285,7 +392,6 @@ def open_memory_backend(config) -> MemoryBackend:
             if mode == "pymem":
                 raise RuntimeError("pymem n'est pas installé (requis pour le backend 'pymem').")
 
-    # Repli : simulation
     backend = MockMemoryBackend()
     backend.attach()
     return backend

@@ -85,12 +85,42 @@ class GameState:
 # Carte mémoire
 # --------------------------------------------------------------------------- #
 @dataclass
-class MemorySignature:
-    """Adresse découverte pour un champ donné, avec sa signature de validation.
+class PointerChain:
+    """Chaîne de pointeurs *persistante* menant à une valeur.
 
-    ``offsets`` : chaîne de pointeurs (base + offsets) menant à la valeur.
-    ``pattern`` : signature AOB (array-of-bytes) servant à re-localiser l'adresse
-                  après une mise à jour du jeu (résistance aux patchs).
+    Résiste aux relances du jeu (ASLR / réallocation du tas) : on stocke un
+    pointeur statique dans le module (``module_base + static_offset``) puis une
+    suite d'offsets. Résolution (sémantique Cheat Engine) :
+
+        ptr = lire_pointeur(module_base + static_offset)
+        pour off in offsets[:-1] : ptr = lire_pointeur(ptr + off)
+        adresse_valeur = ptr + offsets[-1]
+    """
+
+    static_offset: int
+    offsets: list[int] = field(default_factory=list)
+    module: str = ""  # nom du module porteur du pointeur statique (vide = principal)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PointerChain":
+        return cls(
+            static_offset=data.get("static_offset", 0),
+            offsets=list(data.get("offsets", [])),
+            module=data.get("module", ""),
+        )
+
+
+@dataclass
+class MemorySignature:
+    """Adresse découverte pour un champ donné, avec ses moyens de re-localisation.
+
+    ``address``       : adresse absolue isolée (valable pour la session courante).
+    ``pointer_chain`` : chaîne de pointeurs persistante (survit aux relances) ;
+                        si présente, elle est résolue à chaque lecture.
+    ``pattern``       : signature AOB des octets voisins (résistance aux patchs).
     """
 
     field: str
@@ -102,9 +132,66 @@ class MemorySignature:
     # confiance ∈ [0,1] : 1.0 si une seule adresse a survécu, sinon dégressive.
     candidates: list[int] = field(default_factory=list)
     confidence: float = 0.0
+    # Chaîne de pointeurs persistante (None tant qu'aucune n'a été trouvée).
+    pointer_chain: "PointerChain | None" = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MemorySignature":
+        pc = data.get("pointer_chain")
+        return cls(
+            field=data["field"],
+            address=data.get("address", 0),
+            offsets=list(data.get("offsets", [])),
+            pattern=data.get("pattern", ""),
+            value_type=data.get("value_type", "i32"),
+            candidates=list(data.get("candidates", [])),
+            confidence=data.get("confidence", 0.0),
+            pointer_chain=PointerChain.from_dict(pc) if pc else None,
+        )
+
+
+@dataclass
+class ProvinceLayout:
+    """Disposition mémoire du tableau de provinces (structures contiguës).
+
+    Permet de lire dynamiquement toutes les provinces : on résout ``base``
+    (adresse de la 1re structure, via pointeur statique persistant si possible),
+    puis on itère ``count`` fois en sautant de ``stride`` octets, en lisant
+    chaque champ à son offset dans ``field_offsets``.
+    """
+
+    base_address: int = 0
+    stride: int = 0
+    count: int = 0
+    field_offsets: dict[str, int] = field(default_factory=dict)  # nom -> (offset, type)
+    field_types: dict[str, str] = field(default_factory=dict)
+    pointer_chain: "PointerChain | None" = None  # vers base_address (persistant)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "base_address": self.base_address,
+            "stride": self.stride,
+            "count": self.count,
+            "field_offsets": self.field_offsets,
+            "field_types": self.field_types,
+            "pointer_chain": self.pointer_chain.to_dict() if self.pointer_chain else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProvinceLayout":
+        pc = data.get("pointer_chain")
+        return cls(
+            base_address=data.get("base_address", 0),
+            stride=data.get("stride", 0),
+            count=data.get("count", 0),
+            field_offsets={k: int(v) for k, v in data.get("field_offsets", {}).items()},
+            field_types=dict(data.get("field_types", {})),
+            pointer_chain=PointerChain.from_dict(pc) if pc else None,
+        )
 
 
 @dataclass
@@ -115,6 +202,7 @@ class MemoryMap:
     module_base: int = 0
     game_version: str = "unknown"
     signatures: dict[str, MemorySignature] = field(default_factory=dict)
+    province_layout: "ProvinceLayout | None" = None
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -124,18 +212,21 @@ class MemoryMap:
             "game_version": self.game_version,
             "created_at": self.created_at,
             "signatures": {k: v.to_dict() for k, v in self.signatures.items()},
+            "province_layout": self.province_layout.to_dict() if self.province_layout else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MemoryMap":
         sigs = {
-            k: MemorySignature(**v) for k, v in data.get("signatures", {}).items()
+            k: MemorySignature.from_dict(v) for k, v in data.get("signatures", {}).items()
         }
+        pl = data.get("province_layout")
         return cls(
             process_name=data.get("process_name", "eu5.exe"),
             module_base=data.get("module_base", 0),
             game_version=data.get("game_version", "unknown"),
             signatures=sigs,
+            province_layout=ProvinceLayout.from_dict(pl) if pl else None,
             created_at=data.get("created_at", time.time()),
         )
 

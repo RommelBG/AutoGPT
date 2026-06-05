@@ -3,6 +3,8 @@
 from .backend import MemoryBackend, MockMemoryBackend, open_memory_backend
 from .scanner import MemoryScanner
 from .reader import GameStateReader
+from .pointers import PointerScanner
+from .provinces import ProvinceScanner, read_provinces
 
 __all__ = [
     "MemoryBackend",
@@ -10,4 +12,7 @@ __all__ = [
     "open_memory_backend",
     "MemoryScanner",
     "GameStateReader",
+    "PointerScanner",
+    "ProvinceScanner",
+    "read_provinces",
 ]

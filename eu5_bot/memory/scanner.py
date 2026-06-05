@@ -30,6 +30,7 @@ from typing import Callable
 
 from ..models import MemoryMap, MemorySignature
 from .backend import MemoryBackend, MockMemoryBackend
+from .pointers import PointerScanner
 
 
 # Champs recherchés et leur type binaire attendu.
@@ -188,6 +189,7 @@ class MemoryScanner:
             module_base=self.backend.module_base(),
         )
         base = self.backend.module_base()
+        pscanner = PointerScanner(self.backend)  # index de pointeurs construit/réutilisé
         total = len(SCAN_PLAN)
         for i, (field, vtype) in enumerate(SCAN_PLAN.items(), start=1):
             candidates = self.scan_field(
@@ -196,6 +198,12 @@ class MemoryScanner:
             if candidates:
                 addr = candidates[0]
                 confidence = 1.0 if len(candidates) == 1 else max(0.0, 1.0 - (len(candidates) - 1) * 0.2)
+                # Cherche une chaîne de pointeurs persistante vers cette adresse.
+                chain = None
+                try:
+                    chain = pscanner.scan(addr)
+                except Exception:
+                    chain = None
                 mmap.signatures[field] = MemorySignature(
                     field=field,
                     address=addr,
@@ -204,10 +212,41 @@ class MemoryScanner:
                     value_type=vtype,
                     candidates=candidates[:8],
                     confidence=round(confidence, 3),
+                    pointer_chain=chain,
                 )
             if progress:
                 progress(field, i, total)
+
+        # Scan des provinces (auto sur mock ; calibration requise sur jeu réel).
+        self._scan_provinces_auto(mmap, pscanner)
         return mmap
+
+    def scan_provinces(
+        self,
+        calibration_values: dict[str, list],
+        types: dict[str, str],
+        with_pointer_chain: bool = True,
+    ):
+        """Scan du tableau de provinces à partir de valeurs de calibration.
+
+        Utilisé pour le jeu réel (les valeurs viennent de l'écran). Renvoie un
+        ``ProvinceLayout`` ou None.
+        """
+        from .provinces import ProvinceScanner
+
+        pscanner = PointerScanner(self.backend) if with_pointer_chain else None
+        return ProvinceScanner(self.backend, pscanner).scan(calibration_values, types)
+
+    def _scan_provinces_auto(self, mmap: MemoryMap, pscanner: PointerScanner) -> None:
+        """Sur backend mock, calibre et scanne automatiquement les provinces."""
+        backend = self.backend
+        if isinstance(backend, MockMemoryBackend):
+            from .provinces import ProvinceScanner
+
+            values, types = backend.province_calibration()
+            layout = ProvinceScanner(backend, pscanner).scan(values, types)
+            if layout is not None:
+                mmap.province_layout = layout
 
     def load_or_scan(
         self,

@@ -98,10 +98,12 @@ eu5_bot/
 ├── models.py            Dataclasses : GameState, MemoryMap, AdvisorResponse, CouncilDecision
 ├── bot.py               BotController : boucle, contrôles, historique, callbacks
 ├── memory/              PHASE 1 — scan & lecture mémoire
-│   ├── backend.py         Interface MemoryBackend + MockMemoryBackend (simulation)
-│   ├── pymem_backend.py   Backend réel pymem (Windows, importé à la demande)
-│   ├── scanner.py         Scan par valeur + signatures AOB → MemoryMap (cache JSON)
-│   └── reader.py          GameStateReader : adresses → GameState
+│   ├── backend.py         Interface MemoryBackend + MockMemoryBackend (module/tas/pointeurs/provinces)
+│   ├── pymem_backend.py   Backend réel pymem (Windows : enum_regions, index pointeurs)
+│   ├── scanner.py         Scan différentiel scalaire + signatures AOB → MemoryMap (cache JSON)
+│   ├── pointers.py        PointerScanner : chaînes de pointeurs persistantes (anti-ASLR)
+│   ├── provinces.py       ProvinceScanner : tableau de provinces (base/stride/count/offsets)
+│   └── reader.py          GameStateReader : adresses (résolues par pointeur) → GameState
 ├── council/             PHASE 2 — analyse & décision
 │   ├── prompts.py         Prompts système des 4 conseillers + coordinateur (brief)
 │   ├── llm_client.py      Appels Cerebras/DeepSeek/Groq (httpx) + Anthropic (SDK) + mock
@@ -165,9 +167,36 @@ de valeur unique renvoie sur un vrai processus :
 - `MemorySignature` conserve les `candidates` survivants et un score de
   `confidence` (1.0 quand une seule adresse subsiste).
 
+## Chaînes de pointeurs persistantes (anti-ASLR)
+
+Une adresse absolue change à chaque relance du jeu (ASLR, réallocation du tas).
+`memory/pointers.py::PointerScanner` effectue un **pointer scan inverse** : depuis
+l'adresse cible, il remonte les pointeurs (recherche en largeur bornée par
+`max_depth` / `max_offset`) jusqu'à un **pointeur statique** dans le module. La
+chaîne résultante (`static_offset` + `offsets`) est stockée dans la signature et
+**résolue à chaque lecture** — elle survit donc aux relances. Le `GameStateReader`
+privilégie la chaîne de pointeurs et retombe sur l'adresse absolue à défaut.
+
+Le `MockMemoryBackend` modélise un vrai graphe de pointeurs (module → tas) et
+expose `relaunch()` qui rejoue l'ASLR : les tests vérifient que la lecture reste
+correcte après relance via la chaîne de pointeurs.
+
+## Scan des provinces
+
+`memory/provinces.py::ProvinceScanner` traite le **tableau de structures** de
+provinces : il localise le champ `developpement` de deux provinces (par valeur),
+en déduit `base` et `stride`, sonde `count` (fin du tableau), puis détermine
+l'offset de chaque champ en vérifiant sa cohérence sur une seconde province. Une
+chaîne de pointeurs vers la base du tableau est recherchée pour la persistance.
+Le résultat (`ProvinceLayout`) permet de lire dynamiquement toutes les provinces
+(développement, slots, nombre de bâtiments).
+
 ## Notes d'implémentation & limites
 
 - **Coordonnées d'interface** : `actions/executor.py::UI_HINTS` regroupe les
   raccourcis/clics, à calibrer selon la résolution et la version du jeu.
-- **Provinces** : la PHASE 1 cartographie l'économie d'abord (cf. brief) ; le
-  scan provincial réel reste à étendre (le mock fournit un échantillon).
+- **Noms de provinces** : le scan lit les champs numériques (développement,
+  slots, bâtiments) ; les **chaînes de caractères** (noms réels) ne sont pas
+  encore extraites, donc les provinces sont nommées « Province N ». L'exécuteur
+  d'actions devra cibler les provinces par coordonnées/ID plutôt que par nom tant
+  que le scan des chaînes n'est pas implémenté.
